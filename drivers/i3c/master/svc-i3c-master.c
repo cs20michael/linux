@@ -140,8 +140,8 @@
 #define I3C_SCL_PP_PERIOD_NS_MIN 40
 #define I3C_SCL_OD_LOW_PERIOD_NS_MIN 200
 
-#define SVC_I3C_EVENT_IBI	GENMASK(7, 0)
-#define SVC_I3C_EVENT_HOTJOIN	BIT(31)
+#define SVC_I3C_EVENT_IBI	GENMASK(31, 0)
+#define SVC_I3C_EVENT_HOTJOIN	0x100000000ULL
 
 /*
  * SVC_I3C_QUIRK_FIFO_EMPTY:
@@ -261,7 +261,7 @@ struct svc_i3c_master {
 	} ibi;
 	struct mutex lock;
 	const struct svc_i3c_drvdata *drvdata;
-	u32 enabled_events;
+	u64 enabled_events;
 	u32 mctrl_config;
 };
 
@@ -289,7 +289,7 @@ static inline bool svc_has_daa_corrupt(struct svc_i3c_master *master)
 		(SVC_I3C_MCONFIG_SKEW_MASK | SVC_I3C_MCONFIG_ODHPP(1))));
 }
 
-static inline bool is_events_enabled(struct svc_i3c_master *master, u32 mask)
+static inline bool is_events_enabled(struct svc_i3c_master *master, u64 mask)
 {
 	return !!(master->enabled_events & mask);
 }
@@ -669,10 +669,18 @@ static irqreturn_t svc_i3c_master_irq_handler(int irq, void *dev_id)
 	/* Clear the interrupt status */
 	writel(SVC_I3C_MINT_SLVSTART, master->regs + SVC_I3C_MSTATUS);
 
-	/* Ignore the false event */
-	if (svc_has_quirk(master, SVC_I3C_QUIRK_FALSE_SLVSTART) &&
-	    !SVC_I3C_MSTATUS_STATE_SLVREQ(active))
-		return IRQ_HANDLED;
+	if (svc_has_quirk(master, SVC_I3C_QUIRK_FALSE_SLVSTART)) {
+		/*
+		 * A valid event may be missed if it occurs between the status
+		 * read and clear. Re-read the status register to retrieve the
+		 * latest state.
+		 */
+		active = readl(master->regs + SVC_I3C_MSTATUS);
+
+		/* Ignore the false event */
+		if (!SVC_I3C_MSTATUS_STATE_SLVREQ(active))
+			return IRQ_HANDLED;
+	}
 
 	/*
 	 * The SDA line remains low until the request is processed.
@@ -1885,6 +1893,7 @@ static int svc_i3c_master_enable_ibi(struct i3c_dev_desc *dev)
 {
 	struct i3c_master_controller *m = i3c_dev_get_master(dev);
 	struct svc_i3c_master *master = to_svc_i3c_master(m);
+	struct svc_i3c_i2c_dev_data *data = i3c_dev_get_master_data(dev);
 	int ret;
 
 	ret = pm_runtime_resume_and_get(master->dev);
@@ -1893,19 +1902,26 @@ static int svc_i3c_master_enable_ibi(struct i3c_dev_desc *dev)
 		return ret;
 	}
 
-	master->enabled_events++;
+	ret = i3c_master_enec_locked(m, dev->info.dyn_addr, I3C_CCC_EVENT_SIR);
+	if (ret)
+		return ret;
+
+	if (data->ibi >= 0)
+		master->enabled_events |= (1 << data->ibi);
 	svc_i3c_master_enable_interrupts(master, SVC_I3C_MINT_SLVSTART);
 
-	return i3c_master_enec_locked(m, dev->info.dyn_addr, I3C_CCC_EVENT_SIR);
+	return 0;
 }
 
 static int svc_i3c_master_disable_ibi(struct i3c_dev_desc *dev)
 {
 	struct i3c_master_controller *m = i3c_dev_get_master(dev);
 	struct svc_i3c_master *master = to_svc_i3c_master(m);
+	struct svc_i3c_i2c_dev_data *data = i3c_dev_get_master_data(dev);
 	int ret;
 
-	master->enabled_events--;
+	if (data->ibi >= 0)
+		master->enabled_events &= ~(1 << data->ibi);
 	if (!master->enabled_events)
 		svc_i3c_master_disable_interrupts(master);
 
